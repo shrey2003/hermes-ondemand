@@ -1429,6 +1429,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # Bounded lifecycle history lets clients that connect after a tool
+        # call (or after completion) replay what happened instead of seeing an
+        # empty SSE stream.  Entries contain only the already-redacted event
+        # payloads sent to live subscribers.
+        self._run_event_history: Dict[str, List[Dict[str, Any]]] = {}
+        self._run_event_sequences: Dict[str, int] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
@@ -6569,6 +6575,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_EVENT_HISTORY_LIMIT = 500
+
+    def _record_run_event(self, run_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Store one redacted lifecycle event and assign a per-run sequence."""
+        sequence = self._run_event_sequences.get(run_id, 0) + 1
+        self._run_event_sequences[run_id] = sequence
+        event["sequence"] = sequence
+        history = self._run_event_history.setdefault(run_id, [])
+        history.append(event)
+        if len(history) > self._RUN_EVENT_HISTORY_LIMIT:
+            del history[: len(history) - self._RUN_EVENT_HISTORY_LIMIT]
+        status = self._run_statuses.get(run_id)
+        if status is not None:
+            status["event_count"] = sequence
+        return event
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -6595,8 +6616,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             q = self._run_streams.get(run_id)
             if q is None:
+                self._record_run_event(run_id, event)
                 return
             try:
+                event = self._record_run_event(run_id, event)
                 loop.call_soon_threadsafe(q.put_nowait, event)
             except Exception:
                 pass
@@ -6785,6 +6808,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
+            if event is not None:
+                event = self._record_run_event(run_id, event)
             if self._run_streams.get(run_id) is q:
                 q.put_nowait(event)
 
@@ -7117,15 +7142,23 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
 
-        # Allow subscribing slightly before the run is registered (race condition window)
+        # Allow subscribing slightly before the run is registered (race condition window).
+        # Terminal runs remain queryable from their bounded event history even
+        # after the live queue has been closed and removed.
         for _ in range(20):
-            if run_id in self._run_streams:
+            if run_id in self._run_streams or (
+                run_id in self._run_event_history
+                and (self._run_statuses.get(run_id, {}).get("status")
+                     in {"completed", "failed", "cancelled"})
+            ):
                 break
             await asyncio.sleep(0.05)
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
+        q = self._run_streams.get(run_id)
+        history = list(self._run_event_history.get(run_id, []))
+        replay_through = history[-1].get("sequence", 0) if history else 0
         self._run_stream_subscribers.add(run_id)
 
         response = web.StreamResponse(
@@ -7139,6 +7172,17 @@ class APIServerAdapter(BasePlatformAdapter):
         await response.prepare(request)
 
         try:
+            # Replay events first so a late subscriber sees the tool calls
+            # that led to the current status. Sequence numbers prevent a
+            # live queue item already included in the replay from appearing
+            # twice.
+            for event in history:
+                await response.write(_sse_frame(event))
+
+            if q is None:
+                await response.write(b": stream closed\n\n")
+                return response
+
             while True:
                 try:
                     event = await asyncio.wait_for(q.get(), timeout=30.0)
@@ -7149,6 +7193,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
+                if event.get("sequence", 0) <= replay_through:
+                    continue
                 payload = _sse_frame(event)
                 await response.write(payload)
         except Exception as exc:
@@ -7388,6 +7434,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_event_history.pop(run_id, None)
+            self._run_event_sequences.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
