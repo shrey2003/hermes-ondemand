@@ -1,0 +1,7 @@
+name: web-internet-agent
+version: 1.0.0
+description: "Internet Agent API web search backend for serverless Hermes deployments."
+author: OnDemand
+kind: backend
+provides_web_providers:
+  - internet-agent

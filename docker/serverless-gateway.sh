@@ -25,4 +25,10 @@ if [ -n "${OPENROUTER_MODEL:-}" ]; then
     hermes config set model.default "$OPENROUTER_MODEL" >/dev/null
 fi
 
+# Enable the bundled Internet Agent web provider for API-server runs.  This
+# exposes Hermes's existing web_search tool (rather than adding a bespoke core
+# tool) and routes searches to the service described by
+# hermes_cli/internet_plugin_schema.yaml.
+hermes config set web.backend internet-agent >/dev/null
+
 exec hermes gateway run
