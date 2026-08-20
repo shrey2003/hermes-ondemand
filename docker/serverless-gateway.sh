@@ -25,6 +25,18 @@ if [ -n "${OPENROUTER_MODEL:-}" ]; then
     hermes config set model.default "$OPENROUTER_MODEL" >/dev/null
 fi
 
+# Optima benchmark requests are made by the agent through its terminal tool.
+# Terminal sandboxes scrub credentials unless they are explicitly allowlisted;
+# add this optional, non-Hermes provider token to that allowlist while it is
+# present.  Merge with any existing values so deployment-specific passthrough
+# settings are preserved.  The token value is never printed or written here.
+if [ -n "${OPTIMA_AGENT_TOKEN:-}" ]; then
+    _optima_passthrough="$(hermes config get terminal.env_passthrough --json 2>/dev/null || printf '%s' '[]')"
+    _optima_passthrough="$(python3 -c 'import json,sys; v=json.loads(sys.argv[1]); v=v if isinstance(v,list) else []; print(json.dumps(v if "OPTIMA_AGENT_TOKEN" in v else v+["OPTIMA_AGENT_TOKEN"]))' "$_optima_passthrough")"
+    hermes config set terminal.env_passthrough "$_optima_passthrough" >/dev/null
+    unset _optima_passthrough
+fi
+
 # Enable the bundled Internet Agent web provider for API-server runs.  This
 # exposes Hermes's existing web_search tool (rather than adding a bespoke core
 # tool) and routes searches to the service described by
